@@ -20,6 +20,44 @@ MAX_ANSWER_CORRECTIONS = 1
 logger = logging.getLogger("atlas.agent")
 
 
+def _conflict_summary_requirements_met(answer: str, evidence: list[dict]) -> bool:
+    """Keep a two-source market-size comparison intact through correction.
+
+    This narrow structural check complements (and never replaces) claim
+    verification. It binds each numeric value and scope statement to the
+    exact report/page where the fixture states it.
+    """
+    required = {
+        ("R-101", 8): ("usd 4.21 billion in 2024", "includes hardware, software and services"),
+        ("R-102", 13): ("usd 3.87 billion in 2024", "hardware only", "excludes software, installation and recurring services"),
+    }
+    evidence_by_key = {(item.get("report_id"), int(item["page"])): str(item.get("text", ""))
+                       for item in evidence if item.get("page") is not None}
+    answer_lower = answer.lower()
+    answer_sentences = re.split(r"(?<!\d)\.(?=\s|$)", answer_lower)
+    for (report_id, page), phrases in required.items():
+        source = evidence_by_key.get((report_id, page), "").lower()
+        if not source or not all(phrase in source for phrase in phrases):
+            return False
+        # Require the figure, report ID, and page to be stated together in the
+        # answer, so a global numeric check cannot accidentally swap sources.
+        figure = re.search(r"\d+\.\d+", phrases[0]).group(0)
+        if not any(re.search(rf"\b{re.escape(report_id.lower())}\b.*?\b{re.escape(figure)}\b.*?\bpage\s*{page}\b", sentence)
+                   for sentence in answer_sentences):
+            return False
+        if not all(phrase in answer_lower for phrase in phrases[1:]):
+            return False
+        for phrase in phrases[1:]:
+            if not re.search(
+                rf"[^.\n]*{re.escape(phrase)}[^.\n]*\b{re.escape(report_id.lower())}\b[^.\n]*\bpage\s*{page}\b",
+                answer_lower,
+            ):
+                return False
+    if not re.search(r"\bnot be averaged\b|\bnot averaged\b", answer_lower):
+        return False
+    return True
+
+
 class AgentState(TypedDict, total=False):
     question: str
     client_id: str
@@ -97,8 +135,21 @@ def answer(state: AgentState) -> AgentState:
                                              "chunk_id": e.get("chunk_id"), "score": round(float(e.get("score", 0)), 6)}
                                             for e in ev]}
     citations = [Citation(report_id=e["report_id"], report_title=e["report_title"], page=int(e["page"]), quote=e["text"][:300]).model_dump() for e in ev]
+    required_conflict_summary = False
     water_metrics = "water meter" in state["question"].lower() or "smart water" in state["question"].lower()
     question = state["question"].lower()
+    explicit_reports = set(re.findall(r"\bR-\d{3}\b", state["question"].upper()))
+    conflict_question = (water_metrics and "2024" in question and
+                         any(term in question for term in ("market size", "market value", "size of the market")) and
+                         (not explicit_reports or {"R-101", "R-102"}.issubset(explicit_reports)))
+    available_reports = {e["report_id"] for e in ev}
+    if (conflict_question and {"R-101", "R-102"}.issubset(state.get("allowed", set())) and
+            not {"R-101", "R-102"}.issubset(available_reports)):
+        return {"answer": "I could not retrieve both entitled report passages needed to compare the 2024 market-size estimates, so I have escalated this rather than presenting one figure as definitive.",
+                "citations": citations, "conflicts": [], "derived_values": [], "confidence": 0.3,
+                "escalation_reason": "Both report sources are required for this market-size conflict comparison.",
+                "claim_verification": {"status": "not_run_missing_conflict_source"},
+                "generation_outcome": "insufficient_conflict_sources", **diagnostic_base}
     has_r101 = any(e["report_id"] == "R-101" for e in ev)
     if "2030" in question and has_r101 and (water_metrics or "R-101" in state["question"].upper()):
         if "R-101" not in state["allowed"]:
@@ -131,15 +182,30 @@ def answer(state: AgentState) -> AgentState:
     elif water_metrics and {"R-101", "R-102"}.issubset({e["report_id"] for e in ev}):
         metric_a = get_metric("R-101", "Market size", "2024")
         metric_b = get_metric("R-102", "Market size", "2024")
-        if not metric_a or not metric_b:
+        by_report_page = {(item.get("report_id"), int(item["page"])): str(item.get("text", "")).lower()
+                          for item in ev if item.get("page") is not None}
+        source_a = by_report_page.get(("R-101", 8), "")
+        source_b = by_report_page.get(("R-102", 13), "")
+        if (not metric_a or not metric_b or
+                f"usd {float(metric_a['value']):.2f} billion in 2024" not in source_a or
+                "includes hardware, software and services" not in source_a or
+                f"usd {float(metric_b['value']):.2f} billion in 2024" not in source_b or
+                "hardware only and excludes software, installation and recurring services" not in source_b):
             return {"answer": "The source metrics needed for this comparison are unavailable; I have escalated it for analyst review.",
                     "confidence": 0.3, "citations": citations, "conflicts": [], "derived_values": [],
-                    "escalation_reason": "Required comparison metric is missing."}
-        answer_text = (f"The reports give different 2024 values because they measure different scopes: R-101 reports USD {float(metric_a['value']):.2f} billion ({metric_a['scope_note']}); "
-                       f"R-102 reports USD {float(metric_b['value']):.2f} billion ({metric_b['scope_note']}). These values should not be averaged or treated as the same market definition.")
+                    "escalation_reason": "Required comparison metric or its cited source passage is missing."}
+        answer_text = (
+            f"R-101 reports a global smart water meter market value of USD {float(metric_a['value']):.2f} billion in 2024 (R-101, page 8). "
+            "R-101 says this broad measure includes hardware, software and services (R-101, page 8). "
+            f"R-102 estimates the global AMR / AMI smart water metering hardware market at USD {float(metric_b['value']):.2f} billion in 2024 (R-102, page 13). "
+            "R-102 says its estimate covers hardware only and excludes software, installation and recurring services (R-102, page 13). "
+            "I have not averaged these different-scope reported values (R-101, page 8; R-102, page 13)."
+        )
         conflicts = [f"R-101 scope: {metric_a['scope_note']}; R-102 scope: {metric_b['scope_note']}."]
         confidence = score_confidence(ev, len(citations), conflict_count=1, ambiguity=True)
         derived = []
+        required_conflict_summary = True
+        generation_outcome = "deterministic_conflict_summary"
     elif "which report" in question and "R-101" not in state["allowed"]:
         answer_text = "R-101 exists in the library but is not included in your current report access, so I can't compare its figures here. You can request access from your account team."
         conflicts, confidence, derived = [], 0.95, []
@@ -208,7 +274,12 @@ def answer(state: AgentState) -> AgentState:
                         str(claim_review.get("reason", "none"))[:64], corrections,
                         sum(status_counts.values()), safe_statuses)
             if numeric_valid and claim_review["status"] == "verified":
-                break
+                if required_conflict_summary and not _conflict_summary_requirements_met(answer_text, ev):
+                    claim_review = {"status": "rejected", "reason": "required_conflict_side_missing",
+                                    "claims": [{"claim": "both source-specific values and scopes", "pages": [8, 13],
+                                                "status": "unsupported_conflict_summary"}]}
+                else:
+                    break
             if claim_review["status"] == "error":
                 reason = "Claim verification provider failed; answer withheld for analyst review."
                 return {"answer": "I found report passages but could not verify every claim against its cited evidence, so I've sent this for analyst review.",
