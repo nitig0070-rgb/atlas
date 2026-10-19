@@ -95,6 +95,28 @@ def test_claim_on_a_retrieved_but_irrelevant_page_is_rejected(monkeypatch):
     assert "replacement demand" not in prompt["claims"][0]["cited_evidence"][0]["text"]
 
 
+def test_cross_page_product_term_requires_its_own_citation(monkeypatch):
+    # The term is supported on page 4, but the answer cites only page 5.
+    # The semantic critic must not be asked to bless evidence outside that cite.
+    monkeypatch.setattr(critic, "_make_model", lambda _p: (_ for _ in ()).throw(AssertionError("must reject deterministically")))
+    passages = evidence("The report covers point-of-use and point-of-entry filtration.", 4) + evidence(
+        "Included products are countertop, under-sink, and whole-home systems.", 5)
+    result = critic.verify_claims(
+        "The market covers point-of-use and point-of-entry filtration and included products (page 5).",
+        passages,
+    )
+    assert result["status"] == "rejected"
+    assert result["claims"][0]["status"] == "unsupported_cited_term"
+
+
+def test_hyphenated_term_is_accepted_when_its_exact_page_is_cited(monkeypatch):
+    model = VerdictModel()
+    mock_critic(monkeypatch, model)
+    passages = evidence("The report covers point-of-use filtration.", 4)
+    result = critic.verify_claims("The market covers point-of-use filtration (page 4).", passages)
+    assert result["status"] == "verified", result
+
+
 def test_unsupported_number_is_rejected_by_numeric_guard():
     valid, unsupported = critic.verify_numeric_claims("The market is USD 9.99 billion (page 4).", evidence())
     assert not valid
@@ -131,7 +153,8 @@ def test_verifier_malformed_response_fails_closed(monkeypatch):
     assert result["reason"] == "invalid_verifier_response"
 
 
-def test_agent_escalates_when_claim_review_rejects_draft(monkeypatch):
+def test_agent_escalates_when_claim_review_rejects_draft(monkeypatch, caplog):
+    caplog.set_level("INFO", logger="atlas.agent")
     monkeypatch.setattr(agent.settings, "confidence_threshold", 0.70)
     drafts = iter(["The report is driven by replacement demand (page 4).", "The report is driven by replacement demand (page 4)."])
     monkeypatch.setattr(agent, "write_answer", lambda _q, _e: {"answer": next(drafts)})
@@ -142,6 +165,9 @@ def test_agent_escalates_when_claim_review_rejects_draft(monkeypatch):
     assert result["escalation_reason"] == "Generated claims were not fully supported by their cited report passages."
     assert result["generation_outcome"] == "claim_rejected_after_correction"
     assert "discusses replacement demand" not in result["answer"]
+    assert "claim_verification status=rejected" in caplog.text
+    assert "unsupported_wording" in caplog.text
+    assert "The report is driven" not in caplog.text
 
 
 def test_agent_returns_supported_r103_summary_after_one_verified_correction(monkeypatch):
@@ -228,8 +254,9 @@ def test_invalid_citation_can_be_corrected_then_must_pass_verifier(monkeypatch):
 
 def test_correction_prompt_uses_only_supplied_retrieved_evidence(monkeypatch):
     captured = {}
-    def fake_generate(messages):
+    def fake_generate(messages, purpose):
         captured["messages"] = messages
+        captured["purpose"] = purpose
         return {"answer": "The report discusses replacement demand (page 4)."}
     monkeypatch.setattr(writer, "_generate", fake_generate)
     writer.correct_answer("What does R-103 say?", evidence(), "bad draft", {
@@ -237,6 +264,9 @@ def test_correction_prompt_uses_only_supplied_retrieved_evidence(monkeypatch):
     })
     prompt = "\n".join(message[1] for message in captured["messages"])
     assert "The report discusses replacement demand." in prompt
+    assert captured["purpose"] == "correction"
+    assert "When an issue is compound_claim_requires_review" in prompt
+    assert "Repeat the subject in each sentence" in prompt
     assert "R-101" not in prompt
     assert "unauthorized private passage" not in prompt
 

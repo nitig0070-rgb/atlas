@@ -70,7 +70,8 @@ def test_groq_generation_passes_report_text_and_metadata_to_model(monkeypatch):
     assert captured["model_kwargs"]["api_key"] == "test-secret-never-logged"
     assert captured["model_kwargs"]["base_url"] == "https://api.groq.com/openai/v1"
     assert captured["model_kwargs"]["model"] == "openai/gpt-oss-120b"
-    assert captured["model_kwargs"]["max_completion_tokens"] == 700
+    assert captured["model_kwargs"]["max_completion_tokens"] == 1400
+    assert captured["model_kwargs"]["model_kwargs"] == {"reasoning_effort": "low"}
     assert captured["model_kwargs"]["temperature"] == 0
     human_prompt = captured["messages"][1][1]
     assert "R-103" in human_prompt and "page=5" in human_prompt
@@ -79,6 +80,33 @@ def test_groq_generation_passes_report_text_and_metadata_to_model(monkeypatch):
     system_prompt = captured["messages"][0][1]
     assert "[[INSUFFICIENT_EVIDENCE]]" in system_prompt
     assert "do not strengthen that to 'focuses on'" in system_prompt
+
+
+def test_groq_correction_parses_valid_provider_answer_and_keeps_context(monkeypatch):
+    captured = {}
+    corrected = "The report discusses replacement demand (page 4)."
+    class FakeChatModel:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+        def invoke(self, messages):
+            captured["messages"] = messages
+            return SimpleNamespace(content=corrected, usage_metadata={"input_tokens": 50, "output_tokens": 12},
+                                   response_metadata={"finish_reason": "stop", "status_code": 200})
+    monkeypatch.setattr(settings, "llm_provider", "groq")
+    monkeypatch.setattr(settings, "groq_api_key", "test-key")
+    monkeypatch.setattr(settings, "model_name", "openai/gpt-oss-120b")
+    monkeypatch.setattr(writer, "ChatOpenAI", FakeChatModel)
+    result = writer.correct_answer("What does R-103 say?", r103_evidence(),
+                                   "The market is driven by replacement demand (page 4).",
+                                   {"claims": [{"claim": "driven by", "pages": [4], "status": "unsupported_wording"}]})
+    assert result["answer"] == corrected
+    assert result["provider"] == "groq"
+    assert result["finish_reason"] == "stop"
+    assert result["provider_status"] == 200
+    prompt = "\n".join(message[1] for message in captured["messages"])
+    assert "Retrieved evidence" in prompt
+    assert "discusses replacement demand" in prompt
+    assert captured["kwargs"]["model_kwargs"] == {"reasoning_effort": "low"}
 
 
 def test_writer_removes_untrusted_inline_line_citations(monkeypatch):
@@ -108,6 +136,70 @@ def test_malformed_provider_response_has_distinct_safe_error(monkeypatch):
         writer.write_answer("What products are included?", r103_evidence())
     assert caught.value.category == "malformed_response"
     assert caught.value.status_code == 502
+
+
+def test_groq_empty_response_is_distinct_and_has_safe_diagnostics(monkeypatch, caplog):
+    class FakeChatModel:
+        def __init__(self, **_kwargs): pass
+        def invoke(self, _messages):
+            return SimpleNamespace(content="  ", usage_metadata={},
+                                   response_metadata={"finish_reason": "stop", "status_code": 200})
+    monkeypatch.setattr(settings, "llm_provider", "groq")
+    monkeypatch.setattr(settings, "groq_api_key", "test-key")
+    monkeypatch.setattr(writer, "ChatOpenAI", FakeChatModel)
+    with pytest.raises(LLMProviderError) as caught:
+        writer.correct_answer("Summarize R-103", r103_evidence(), "Rejected draft", {"claims": []})
+    assert caught.value.category == "empty_response"
+    assert caught.value.diagnostics == {"provider_status": 200, "finish_reason": "stop", "response_length": 2}
+    assert "Rejected draft" not in str(caught.value)
+    assert "provider_call purpose=correction provider=groq" in caplog.text
+    assert "provider_status=200 finish_reason=stop" in caplog.text
+    assert "response_length=2" in caplog.text
+    assert "Rejected draft" not in caplog.text
+
+
+def test_groq_completion_limit_empty_response_is_not_misreported_as_empty(monkeypatch):
+    class FakeChatModel:
+        def __init__(self, **_kwargs): pass
+        def invoke(self, _messages):
+            return SimpleNamespace(content="", usage_metadata={},
+                                   response_metadata={"finish_reason": "length"})
+    monkeypatch.setattr(settings, "llm_provider", "groq")
+    monkeypatch.setattr(settings, "groq_api_key", "test-key")
+    monkeypatch.setattr(writer, "ChatOpenAI", FakeChatModel)
+    with pytest.raises(LLMProviderError) as caught:
+        writer.correct_answer("Summarize R-103", r103_evidence(), "Rejected draft", {"claims": []})
+    assert caught.value.category == "incomplete_response"
+    assert caught.value.diagnostics["finish_reason"] == "length"
+
+
+def test_groq_refusal_is_distinct_and_withheld(monkeypatch):
+    class FakeChatModel:
+        def __init__(self, **_kwargs): pass
+        def invoke(self, _messages):
+            return SimpleNamespace(content="", additional_kwargs={"refusal": "policy refusal"},
+                                   usage_metadata={}, response_metadata={"finish_reason": "stop"})
+    monkeypatch.setattr(settings, "llm_provider", "groq")
+    monkeypatch.setattr(settings, "groq_api_key", "test-key")
+    monkeypatch.setattr(writer, "ChatOpenAI", FakeChatModel)
+    with pytest.raises(LLMProviderError) as caught:
+        writer.correct_answer("Summarize R-103", r103_evidence(), "Rejected draft", {"claims": []})
+    assert caught.value.category == "refusal"
+    assert "policy refusal" not in str(caught.value)
+
+
+def test_groq_unexpected_content_block_is_malformed(monkeypatch):
+    class FakeChatModel:
+        def __init__(self, **_kwargs): pass
+        def invoke(self, _messages):
+            return SimpleNamespace(content=[{"type": "tool_use", "id": "private"}], usage_metadata={})
+    monkeypatch.setattr(settings, "llm_provider", "groq")
+    monkeypatch.setattr(settings, "groq_api_key", "test-key")
+    monkeypatch.setattr(writer, "ChatOpenAI", FakeChatModel)
+    with pytest.raises(LLMProviderError) as caught:
+        writer.correct_answer("Summarize R-103", r103_evidence(), "Rejected draft", {"claims": []})
+    assert caught.value.category == "malformed_response"
+    assert "private" not in str(caught.value)
 
 
 def test_writer_parses_evidence_abstention_marker(monkeypatch):

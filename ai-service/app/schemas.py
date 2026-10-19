@@ -30,5 +30,3 @@ class ChatResponse(BaseModel):
 
 class IngestRequest(BaseModel):
     report_id: str = Field(pattern=r"^R-[0-9]{3}$")
-
-\n

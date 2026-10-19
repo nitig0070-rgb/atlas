@@ -30,5 +30,3 @@ def is_unsafe_request(text: str) -> bool:
 
 def injection_detected(text: str) -> bool:
     return any(re.search(p, text, re.IGNORECASE) for p in INJECTION_PATTERNS)
-
-\n

@@ -1,4 +1,6 @@
 import re
+import logging
+from collections import Counter
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -15,6 +17,7 @@ from app.security import is_unsafe_request
 from app.calculator import calculate_future_value
 
 MAX_ANSWER_CORRECTIONS = 1
+logger = logging.getLogger("atlas.agent")
 
 
 class AgentState(TypedDict, total=False):
@@ -195,6 +198,15 @@ def answer(state: AgentState) -> AgentState:
                 claim_review = {"status": "rejected", "reason": "numeric_claim_rejected",
                                 "claims": [{"claim": "numeric value or page reference", "pages": [],
                                             "status": "unsupported_number"}]}
+            status_counts = Counter(item.get("status", "unknown") for item in claim_review.get("claims", []))
+            safe_statuses = {key: status_counts[key] for key in sorted(status_counts)
+                             if key in {"supported", "unsupported", "unsupported_wording", "missing_citation",
+                                        "invalid_citation", "compound_claim_requires_review", "ambiguous_report_citation",
+                                        "verifier_error", "unsupported_number"}}
+            logger.info("claim_verification status=%s reason=%s correction_attempt=%d claim_count=%d statuses=%s",
+                        str(claim_review.get("status", "unknown"))[:32],
+                        str(claim_review.get("reason", "none"))[:64], corrections,
+                        sum(status_counts.values()), safe_statuses)
             if numeric_valid and claim_review["status"] == "verified":
                 break
             if claim_review["status"] == "error":

@@ -81,5 +81,3 @@ def get_metric(report_id: str, metric: str, period: str):
     with readonly_engine.connect() as conn:
         row = conn.execute(query, {"report": report_id, "metric": metric, "period": period}).mappings().first()
         return dict(row) if row else None
-
-\n
