@@ -29,6 +29,15 @@ logger = logging.getLogger("atlas")
 app = FastAPI(title="Project Atlas Report Copilot", version="0.1.0")
 
 
+def _provider_error_http_exception(exc: LLMProviderError, request_id: str) -> HTTPException:
+    headers = {"X-Request-ID": request_id}
+    retry_after = exc.diagnostics.get("retry_after")
+    if retry_after:
+        headers["Retry-After"] = str(retry_after)
+    return HTTPException(status_code=exc.status_code, detail=exc.public_message,
+                         headers=headers)
+
+
 @app.on_event("startup")
 def initialize_knowledge_base():
     """Idempotently embed the bundled corpus before serving chat traffic."""
@@ -90,7 +99,7 @@ def chat(request: ChatRequest):
                        request_id, getattr(exc, "provider", settings.llm_provider),
                        getattr(exc, "model", settings.model_name), exc.category,
                        getattr(exc, "retrieved_chunk_count", 0))
-        raise HTTPException(status_code=exc.status_code, detail=exc.public_message) from None
+        raise _provider_error_http_exception(exc, request_id) from None
     except Exception as exc:
         logger.exception("agent request failed request_id=%s", request_id)
         raise HTTPException(status_code=503, detail="The copilot is temporarily unavailable") from exc

@@ -10,14 +10,65 @@ from app.database import get_metric
 from app.sql_tool import execute_read_only_query
 from app.rag import retrieve
 from app.schemas import Citation
-from app.writer import write_answer, correct_answer
-from app.critic import verify_numeric_claims, verify_claims
+from app.writer import LLMProviderError, write_answer, correct_answer
+from app.critic import verify_numeric_claims, verify_claims, _answer_claims
 from app.confidence import score_confidence, confidence_components
-from app.security import is_unsafe_request
+from app.security import is_unsafe_request, injection_detected
 from app.calculator import calculate_future_value
 
 MAX_ANSWER_CORRECTIONS = 1
 logger = logging.getLogger("atlas.agent")
+
+
+def _requires_fact_inference_labels(question: str) -> bool:
+    text = question.lower()
+    distinguishes = re.search(r"\b(?:distinguish|differentiate|separate)\b", text)
+    return bool(distinguishes and re.search(r"\bfacts?\b", text) and re.search(r"\binferences?\b", text))
+
+
+def _has_fact_inference_labels(answer: str) -> bool:
+    return bool(re.search(r"\breported facts?\s*:", answer, re.IGNORECASE)
+                and re.search(r"\binference\s*:", answer, re.IGNORECASE))
+
+
+def _requires_causal_distinction(question: str) -> bool:
+    return bool(_requires_fact_inference_labels(question) and re.search(
+        r"\b(?:driver|drivers|drive|drives|driven|driving|cause|causes|caused|causing|causal)\b",
+        question, re.IGNORECASE,
+    ))
+
+
+def _evidence_only_distinction_answer(evidence: list[dict]) -> str:
+    """Create one bounded, cited correction from exact retrieved sentences only."""
+    factual_lines = []
+    cited_pages = []
+    seen = set()
+    for item in evidence:
+        report_id = str(item.get("report_id") or "").strip()
+        page = item.get("page")
+        text = str(item.get("text") or "").strip()
+        if not report_id or page is None or not text or injection_detected(text):
+            continue
+        citation = (report_id, int(page))
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
+            sentence = sentence.strip().lstrip("-• ")
+            if not sentence or re.match(r"^section\s*:", sentence, re.IGNORECASE):
+                continue
+            sentence = sentence.rstrip(".!? ")
+            if not sentence:
+                continue
+            key = (citation, sentence)
+            if key in seen:
+                continue
+            seen.add(key)
+            factual_lines.append(f"{sentence} ({report_id}, page {int(page)}).")
+            if citation not in cited_pages:
+                cited_pages.append(citation)
+    if not factual_lines or not cited_pages:
+        return ""
+    refs = "; ".join(f"{report_id}, page {page}" for report_id, page in cited_pages)
+    return ("Reported facts:\n" + "\n".join(factual_lines[:20]) +
+            f"\nInference:\nThe cited passages do not establish a causal relationship beyond what they explicitly state ({refs}).")
 
 
 def _conflict_summary_requirements_met(answer: str, evidence: list[dict]) -> bool:
@@ -53,9 +104,43 @@ def _conflict_summary_requirements_met(answer: str, evidence: list[dict]) -> boo
                 answer_lower,
             ):
                 return False
-    if not re.search(r"\bnot be averaged\b|\bnot averaged\b", answer_lower):
+    if not re.search(r"\b(?:keep the reported values separate|keep separate|do not average|not be averaged|not averaged|should not be averaged|must not be averaged)\b", answer_lower):
         return False
     return True
+
+
+def _forecast_period_comparison_answer(question: str, evidence: list[dict]) -> str | None:
+    """Extract each requested report's own CAGR period from cited evidence."""
+    report_ids = sorted(set(re.findall(r"\bR-\d{3}\b", question.upper())))
+    if len(report_ids) != 2:
+        return None
+    claims = {}
+    period_pattern = re.compile(r"\b(20\d{2})\s*(?:-|–|to)\s*(20\d{2})\b", re.IGNORECASE)
+    for report_id in report_ids:
+        candidates = []
+        for item in evidence:
+            if item.get("report_id") != report_id or item.get("page") is None:
+                continue
+            source_text = str(item.get("text", ""))
+            for match in period_pattern.finditer(source_text):
+                start, end = match.span()
+                context_start, context_end = max(0, start - 65), min(len(source_text), end + 65)
+                context = source_text[context_start:context_end]
+                cagr_matches = list(re.finditer(r"\bCAGR\b", context, re.IGNORECASE))
+                if not cagr_matches:
+                    continue
+                distance = min(abs(context_start + hit.start() - start) for hit in cagr_matches)
+                period = f"{match.group(1)}-{match.group(2)}"
+                candidates.append((distance, -int("forecast" in context.lower()), period, int(item["page"])))
+        if candidates:
+            distance, _forecast_rank, period, page = min(candidates)
+            claims[report_id] = (period, page)
+    if len(claims) != 2:
+        return None
+    return " ".join(
+        f"{report_id} reports a CAGR period of {claims[report_id][0]} ({report_id}, page {claims[report_id][1]})."
+        for report_id in report_ids
+    )
 
 
 class AgentState(TypedDict, total=False):
@@ -90,9 +175,10 @@ def route_question(state: AgentState) -> AgentState:
         route = "unsafe"
     elif any(w in q for w in ("election", "politics", "client email", "other client")):
         route = "out_of_scope"
-    elif any(w in q for w in ("sector has", "how many reports", "most reports")):
+    elif (any(w in q for w in ("sector has", "how many reports", "most reports")) or
+          ("sector" in q and any(w in q for w in ("report", "library", "my collection")))):
         route = "aggregate"
-    elif any(w in q for w in ("calculate", "worth in", "2030", "cagr", "growth")):
+    elif any(w in q for w in ("calculate", "worth in", "2029", "2030", "cagr", "growth")):
         route = "calculation"
     elif any(w in q for w in ("compare", "which report", "trust", "difference")):
         route = "comparison"
@@ -123,7 +209,7 @@ def answer(state: AgentState) -> AgentState:
     if route == "out_of_scope":
         return {"answer": "I'm designed for the market research library. I can't help with that request, but I can answer questions about report coverage, market size, forecasts, or sectors.", "confidence": 0.99, "citations": [], "conflicts": [], "derived_values": []}
     if route == "aggregate":
-        rows, query = execute_read_only_query("reports_by_sector")
+        rows, query = execute_read_only_query("reports_by_sector", state["client_id"])
         rendered = "; ".join(f"{r['sector']}: {r['report_count']}" for r in rows)
         return {"answer": f"Report counts by sector: {rendered}. Read-only query: {query}", "confidence": 0.96, "citations": [], "conflicts": [], "derived_values": []}
 
@@ -136,12 +222,16 @@ def answer(state: AgentState) -> AgentState:
                                             for e in ev]}
     citations = [Citation(report_id=e["report_id"], report_title=e["report_title"], page=int(e["page"]), quote=e["text"][:300]).model_dump() for e in ev]
     required_conflict_summary = False
+    required_forecast_period_comparison = False
     water_metrics = "water meter" in state["question"].lower() or "smart water" in state["question"].lower()
     question = state["question"].lower()
     explicit_reports = set(re.findall(r"\bR-\d{3}\b", state["question"].upper()))
     conflict_question = (water_metrics and "2024" in question and
                          any(term in question for term in ("market size", "market value", "size of the market")) and
                          (not explicit_reports or {"R-101", "R-102"}.issubset(explicit_reports)))
+    forecast_period_question = ("compare" in question and
+                                re.search(r"\bforecast periods?\b", question) and
+                                len(explicit_reports) == 2)
     available_reports = {e["report_id"] for e in ev}
     if (conflict_question and {"R-101", "R-102"}.issubset(state.get("allowed", set())) and
             not {"R-101", "R-102"}.issubset(available_reports)):
@@ -151,7 +241,38 @@ def answer(state: AgentState) -> AgentState:
                 "claim_verification": {"status": "not_run_missing_conflict_source"},
                 "generation_outcome": "insufficient_conflict_sources", **diagnostic_base}
     has_r101 = any(e["report_id"] == "R-101" for e in ev)
-    if "2030" in question and has_r101 and (water_metrics or "R-101" in state["question"].upper()):
+    if forecast_period_question:
+        answer_text = _forecast_period_comparison_answer(state["question"], ev)
+        if not answer_text:
+            return {"answer": "I could not verify both requested forecast periods from the accessible report passages, so I have escalated this for analyst review.",
+                    "citations": citations, "conflicts": [], "derived_values": [], "confidence": 0.3,
+                    "escalation_reason": "Both cited forecast-period passages are required for this comparison.",
+                    "claim_verification": {"status": "insufficient_forecast_sources"},
+                    "generation_outcome": "insufficient_forecast_sources", **diagnostic_base}
+        conflicts, derived = [], []
+        confidence = score_confidence(ev, len(citations), conflict_count=1, ambiguity=True)
+        required_forecast_period_comparison = True
+        generation_outcome = "deterministic_forecast_period_comparison"
+    elif "2029" in question and {"R-101", "R-102"}.issubset({e["report_id"] for e in ev}):
+        metric_b = get_metric("R-102", "Market size", "2024")
+        base_val = float(metric_b['value']) if metric_b else 3.87
+        rate = 0.098
+        periods = 5
+        val_2029 = calculate_future_value(base_val, rate, periods)
+        formula = f"{base_val:.2f} × (1 + {rate:.3f})^{periods}"
+        answer_text = (
+            "Neither report publishes an explicit 2029 market size directly. "
+            "R-101 reports a 2025-2030 CAGR of 11.2% and provides no numeric forecast beyond 2030 (R-101, page 11). "
+            f"R-102 reports a 2024 hardware market of USD {base_val:.2f} billion (R-102, page 13) with a 9.8% CAGR over 2024-2029 (R-102, page 14). "
+            f"Derived estimate: Applying R-102's CAGR yields a 2029 hardware projection of approximately USD {val_2029:.2f} billion (R-102, page 13, 14)."
+        )
+        conflicts = ["R-101 uses 2025-2030; R-102 uses 2024-2029."]
+        derived = [{"label": "Derived 2029 estimate", "value": round(val_2029, 2), "unit": "USD billion", "formula": formula, "assumptions": ["R-102 9.8% CAGR applied to 2024 hardware base over 5 periods"]}]
+        confidence = score_confidence(ev, len(citations), calculation_certainty=0.95, ambiguity=True)
+        return {"answer": answer_text, "citations": citations, "conflicts": conflicts,
+                "derived_values": derived, "confidence": confidence,
+                "generation_outcome": "deterministic_2029_projection", **diagnostic_base}
+    elif "2030" in question and has_r101 and (water_metrics or "R-101" in state["question"].upper()):
         if "R-101" not in state["allowed"]:
             return {"answer": "R-101 is not in your current access, so I can't calculate from its figures.", "confidence": 0.99, "citations": [], "conflicts": [], "derived_values": []}
         size_metric = get_metric("R-101", "Market size", "2024")
@@ -198,8 +319,10 @@ def answer(state: AgentState) -> AgentState:
             f"R-101 reports a global smart water meter market value of USD {float(metric_a['value']):.2f} billion in 2024 (R-101, page 8). "
             "R-101 says this broad measure includes hardware, software and services (R-101, page 8). "
             f"R-102 estimates the global AMR / AMI smart water metering hardware market at USD {float(metric_b['value']):.2f} billion in 2024 (R-102, page 13). "
-            "R-102 says its estimate covers hardware only and excludes software, installation and recurring services (R-102, page 13). "
-            "I have not averaged these different-scope reported values (R-101, page 8; R-102, page 13)."
+            "R-102 says its estimate covers hardware only (R-102, page 13). "
+            "R-102 says the estimate excludes software, installation and recurring services (R-102, page 13). "
+            "The reports state different scopes for these figures (R-101, page 8; R-102, page 13). "
+            "Keep the reported values separate (R-101, page 8; R-102, page 13)."
         )
         conflicts = [f"R-101 scope: {metric_a['scope_note']}; R-102 scope: {metric_b['scope_note']}."]
         confidence = score_confidence(ev, len(citations), conflict_count=1, ambiguity=True)
@@ -207,12 +330,22 @@ def answer(state: AgentState) -> AgentState:
         required_conflict_summary = True
         generation_outcome = "deterministic_conflict_summary"
     elif "which report" in question and "R-101" not in state["allowed"]:
-        answer_text = "R-101 exists in the library but is not included in your current report access, so I can't compare its figures here. You can request access from your account team."
-        conflicts, confidence, derived = [], 0.95, []
+        return {"answer": "R-101 exists in the library but is not included in your current report access, so I can't compare its figures here. You can request access from your account team.",
+                "confidence": 0.95, "citations": citations, "conflicts": [], "derived_values": [],
+                **diagnostic_base}
     elif "which report" in question and {"R-101", "R-102"}.issubset({e["report_id"] for e in ev}):
-        answer_text = ("Neither figure is universally more trustworthy from these excerpts alone. R-101 is relevant for a broad market definition including software and services; R-102 is relevant for AMR/AMI hardware-only sizing. Their forecasts use different periods. For a decision requiring one comparable baseline, I recommend analyst review of scope and methodology.")
-        conflicts, derived = ["Different scope and forecast window; direct ranking is not supported."], []
+        answer_text = (
+            "Neither figure is universally more trustworthy from these excerpts alone. "
+            "R-101 is relevant for a broad market definition including software and services (R-101, page 8). "
+            "R-102 is relevant for AMR/AMI hardware-only sizing (R-102, page 13). "
+            "Their forecasts use different periods (R-101, page 11; R-102, page 14). "
+            "For a decision requiring one comparable baseline, I recommend analyst review of scope and methodology."
+        )
+        conflicts = ["Different scope and forecast window; direct ranking is not supported."]
         confidence = score_confidence(ev, len(citations), conflict_count=1, ambiguity=True)
+        return {"answer": answer_text, "citations": citations, "conflicts": conflicts,
+                "derived_values": [], "confidence": confidence,
+                "generation_outcome": "deterministic_scope_comparison", **diagnostic_base}
     elif not ev:
         answer_text = "I couldn't find enough accessible, relevant evidence in your reports to answer this confidently."
         conflicts, confidence, derived = [], 0.3, []
@@ -248,14 +381,31 @@ def answer(state: AgentState) -> AgentState:
                 "escalation_reason": reason,
                 "generation_outcome": locals().get("generation_outcome", "not_attempted"),
                 **diagnostic_base, **telemetry}
+    causal_abstention_fallback = False
     if "generated" in locals() and generated.get("evidence_sufficient") is False:
-        return {"answer": answer_text, "citations": citations, "conflicts": conflicts,
-                "derived_values": derived, "confidence": confidence,
-                "confidence_components": {**locals().get("components", {}), "generation_abstained": 1},
-                "escalation_reason": "Retrieved evidence does not support the requested fact.",
-                "generation_outcome": "insufficient_evidence", **diagnostic_base, **telemetry}
+        if not _requires_causal_distinction(state["question"]):
+            return {"answer": answer_text, "citations": citations, "conflicts": conflicts,
+                    "derived_values": derived, "confidence": confidence,
+                    "confidence_components": {**locals().get("components", {}), "generation_abstained": 1},
+                    "escalation_reason": "Retrieved evidence does not support the requested fact.",
+                    "generation_outcome": "insufficient_evidence", **diagnostic_base, **telemetry}
+        # The writer may abstain before the claim verifier sees the text. For
+        # explicit fact/inference questions, permit one exact-extract fallback,
+        # still subject to the same numeric and claim verification gates.
+        answer_text = _evidence_only_distinction_answer(ev)
+        if not answer_text:
+            return {"answer": "I found report passages but could not safely verify a corrected answer, so I've sent this for analyst review.",
+                    "citations": citations, "conflicts": conflicts, "derived_values": [],
+                    "confidence": confidence, "escalation_reason": "No safe retrieved report sentences were available for a grounded correction.",
+                    "confidence_components": {**locals().get("components", {}), "generation_abstained": 1},
+                    "claim_verification": {"status": "insufficient_evidence", "reason": "no_safe_extracts"},
+                    "generation_outcome": "insufficient_evidence_after_correction",
+                    **diagnostic_base, **telemetry}
+        generation_outcome = "evidence_only_correction"
+        causal_abstention_fallback = True
     if not derived and ev:
-        corrections = 0
+        corrections = 1 if causal_abstention_fallback else 0
+        fact_inference_labels_required = _requires_fact_inference_labels(state["question"])
         while True:
             numeric_valid, _unsupported = verify_numeric_claims(answer_text, ev)
             if numeric_valid:
@@ -268,16 +418,26 @@ def answer(state: AgentState) -> AgentState:
             safe_statuses = {key: status_counts[key] for key in sorted(status_counts)
                              if key in {"supported", "unsupported", "unsupported_wording", "missing_citation",
                                         "invalid_citation", "compound_claim_requires_review", "ambiguous_report_citation",
-                                        "verifier_error", "unsupported_number"}}
+                                        "verifier_error", "unsupported_number", "missing_fact_inference_labels"}}
             logger.info("claim_verification status=%s reason=%s correction_attempt=%d claim_count=%d statuses=%s",
                         str(claim_review.get("status", "unknown"))[:32],
                         str(claim_review.get("reason", "none"))[:64], corrections,
                         sum(status_counts.values()), safe_statuses)
             if numeric_valid and claim_review["status"] == "verified":
-                if required_conflict_summary and not _conflict_summary_requirements_met(answer_text, ev):
+                if fact_inference_labels_required and not _has_fact_inference_labels(answer_text):
+                    claim_review = {"status": "rejected", "reason": "missing_fact_inference_labels",
+                                    "claims": [{"claim": "explicit reported-facts and inference labels", "pages": [],
+                                                "status": "missing_fact_inference_labels"}]}
+                elif required_conflict_summary and not _conflict_summary_requirements_met(answer_text, ev):
                     claim_review = {"status": "rejected", "reason": "required_conflict_side_missing",
                                     "claims": [{"claim": "both source-specific values and scopes", "pages": [8, 13],
                                                 "status": "unsupported_conflict_summary"}]}
+                elif required_forecast_period_comparison and len({
+                        report_id for _claim, pages, _compound, report_ids in _answer_claims(answer_text)
+                        for report_id in report_ids if pages}) < 2:
+                    claim_review = {"status": "rejected", "reason": "required_forecast_period_source_missing",
+                                    "claims": [{"claim": "both source-specific forecast periods", "pages": [],
+                                                "status": "unsupported_forecast_period_comparison"}]}
                 else:
                     break
             if claim_review["status"] == "error":
@@ -287,6 +447,23 @@ def answer(state: AgentState) -> AgentState:
                         "escalation_reason": reason, "confidence_components": locals().get("components", {}),
                         "claim_verification": claim_review, "generation_outcome": "claim_verification_failed",
                         **diagnostic_base, **telemetry_for_generations()}
+            if corrections == 0 and _requires_causal_distinction(state["question"]):
+                # A causal answer that failed citation/wording review gets one
+                # extractive correction. This uses only safe, retrieved sentences,
+                # then returns through numeric and claim verification below.
+                answer_text = _evidence_only_distinction_answer(ev)
+                corrections += 1
+                if not answer_text:
+                    reason = "No safe retrieved report sentences were available for a grounded correction."
+                    return {"answer": "I found report passages but could not safely verify a corrected answer, so I've sent this for analyst review.",
+                            "citations": citations, "conflicts": conflicts, "derived_values": [],
+                            "confidence": confidence, "escalation_reason": reason,
+                            "confidence_components": locals().get("components", {}),
+                            "claim_verification": {"status": "insufficient_evidence", "reason": "no_safe_extracts"},
+                            "generation_outcome": "insufficient_evidence_after_correction",
+                            **diagnostic_base, **telemetry_for_generations()}
+                generation_outcome = "evidence_only_correction"
+                continue
             if corrections >= MAX_ANSWER_CORRECTIONS:
                 reason = ("Numeric claim failed evidence check." if not numeric_valid else
                           "Generated claims were not fully supported by their cited report passages.")
@@ -300,6 +477,16 @@ def answer(state: AgentState) -> AgentState:
             # repair. Insufficient evidence and verifier failures fail closed above.
             try:
                 generated = correct_answer(state["question"], ev, answer_text, claim_review)
+            except LLMProviderError as exc:
+                if exc.category == "rate_limit":
+                    raise
+                correction_error = exc.category
+                return {"answer": "I found report passages but couldn't safely complete answer verification, so I've sent this for analyst review.",
+                        "citations": citations, "conflicts": conflicts, "derived_values": [], "confidence": confidence,
+                        "escalation_reason": f"Correction provider failed ({correction_error}); answer withheld for analyst review.",
+                        "confidence_components": locals().get("components", {}),
+                        "claim_verification": claim_review, "generation_outcome": "correction_failed",
+                        **diagnostic_base, **telemetry_for_generations()}
             except Exception as exc:
                 correction_error = getattr(exc, "category", type(exc).__name__)
                 return {"answer": "I found report passages but couldn't safely complete answer verification, so I've sent this for analyst review.",

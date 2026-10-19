@@ -65,12 +65,16 @@ def record_request(client_id: str, request_id: str, latency_ms: int, route: str,
                           "input": input_tokens, "output": output_tokens, "cost": estimated_cost})
 
 
-def aggregate_report_count() -> tuple[list[dict], str]:
-    query = "SELECT /*+ MAX_EXECUTION_TIME(3000) */ sector, COUNT(*) AS report_count FROM reports GROUP BY sector ORDER BY report_count DESC, sector LIMIT 20"
+def aggregate_report_count(client_id: str) -> tuple[list[dict], str]:
+    """Aggregate only reports granted to the requesting client."""
+    query = ("SELECT /*+ MAX_EXECUTION_TIME(3000) */ r.sector, COUNT(DISTINCT r.id) AS report_count "
+             "FROM reports AS r JOIN client_report_entitlements AS e ON e.report_id=r.id "
+             "WHERE e.client_id=:client_id GROUP BY r.sector "
+             "ORDER BY report_count DESC, r.sector LIMIT 20")
     if readonly_engine is None:
         raise RuntimeError("READONLY_DATABASE_URL must be configured for aggregate SQL")
     with readonly_engine.connect() as conn:
-        rows = conn.execute(text(query)).mappings().all()
+        rows = conn.execute(text(query), {"client_id": client_id}).mappings().all()
         return [dict(row) for row in rows], query
 
 

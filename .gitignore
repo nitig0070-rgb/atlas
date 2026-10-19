@@ -23,6 +23,7 @@ mysql_data/
 *.log
 *.log.*
 ci3/application/logs/*
+*.tmp
 
 # Local dependency/build output
 vendor/

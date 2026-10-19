@@ -44,7 +44,10 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      - ./ai-service/app:/app/app
+      - ./ai-service/evaluation:/app/evaluation
       - ./ai-service/data/reports:/app/data/reports:ro
+      - ~/.cache/huggingface:/root/.cache/huggingface
     healthcheck:
       test: ["CMD", "python", "-c", "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5); exit(0 if json.load(r)['status']=='ok' else 1)"]
       interval: 10s
@@ -57,13 +60,15 @@ services:
     environment:
       AI_SERVICE_URL: http://api:8000
       AI_SERVICE_API_KEY: ${API_KEY}
-      DB_PASSWORD: ${MYSQL_PASSWORD:-change_me_local_only}
+      DB_PASSWORD: ${MYSQL_PASSWORD:-atlas_dev_password}
       CI3_ENCRYPTION_KEY: ${CI3_ENCRYPTION_KEY:-change-this-local-session-key-before-use}
     depends_on:
       api:
         condition: service_healthy
     ports:
       - "8080:80"
+    volumes:
+      - ./ci3/application:/var/www/html/application
     healthcheck:
       test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1/') === false);"]
       interval: 10s

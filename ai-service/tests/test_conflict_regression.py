@@ -1,4 +1,7 @@
-from app import agent
+import json
+from types import SimpleNamespace
+
+from app import agent, critic
 from app.critic import _answer_claims, verify_numeric_claims
 from app.rag import REPORT_DIR, parse_report
 from app.config import settings
@@ -12,7 +15,7 @@ def conflict_evidence():
     for report_id in ("R-101", "R-102"):
         path = next(REPORT_DIR.glob(f"{report_id}_*.md"))
         for chunk in parse_report(path):
-            if chunk["page"] in ({8, 9} if report_id == "R-101" else {13, 15}):
+            if chunk["page"] in ({8, 9, 11} if report_id == "R-101" else {13, 14, 15}):
                 result.append({**chunk, "score": 0.82, "chunk_id": f"{report_id}-{chunk['page']}"})
     return result
 
@@ -45,8 +48,9 @@ def test_conflict_answer_keeps_both_values_with_source_page_citations(monkeypatc
     assert not result.get("escalation_reason")
     assert "USD 4.21 billion" in result["answer"]
     assert "USD 3.87 billion" in result["answer"]
-    assert "not averaged" in result["answer"].lower()
-    assert "average" not in result["answer"].lower().replace("not averaged", "")
+    assert "keep the reported values separate" in result["answer"].lower()
+    assert "average" not in result["answer"].lower()
+    assert "usd 4.04" not in result["answer"].lower()
     assert "includes hardware, software and services" in result["answer"].lower()
     assert "hardware only" in result["answer"].lower()
     assert "excludes software, installation and recurring services" in result["answer"].lower()
@@ -67,6 +71,51 @@ def test_conflict_answer_keeps_both_values_with_source_page_citations(monkeypatc
     assert "USD 3.87 billion in 2024" in by_source[("R-102", 13)]
     assert "hardware only and excludes software, installation and recurring services" in by_source[("R-102", 13)]
     assert verify_numeric_claims(result["answer"], evidence) == (True, [])
+    assert all(not unresolved for _claim, _pages, unresolved, _reports in _answer_claims(result["answer"]))
+
+
+def test_conflict_answer_uses_cited_scope_inference_not_assistant_process_claim(monkeypatch):
+    evidence = conflict_evidence()
+    stub_metrics(monkeypatch)
+    monkeypatch.setattr(settings, "confidence_threshold", 0.70)
+    monkeypatch.setattr(agent, "verify_claims", lambda _answer, _evidence: {
+        "status": "verified", "reason": None, "claims": [{"status": "supported"}],
+    })
+
+    result = agent.answer({"question": "Compare 2024 global smart water meter market sizes in R-101 and R-102.",
+                           "allowed": {"R-101", "R-102"}, "route": "factual_lookup", "evidence": evidence})
+
+    assert not result.get("escalation_reason")
+    assert "I have not averaged" not in result["answer"]
+    assert "different scopes" in result["answer"].lower()
+    assert "keep the reported values separate" in result["answer"].lower()
+    assert "average" not in result["answer"].lower()
+    assert "R-101, page 8; R-102, page 13" in result["answer"]
+
+
+def test_critic_prompt_limits_noncomparability_to_cited_scope_differences(monkeypatch):
+    evidence = conflict_evidence()
+    inspected = {}
+
+    class Model:
+        def invoke(self, messages):
+            payload = json.loads(messages[1][1])
+            inspected["task"] = payload["task"].lower()
+            decisions = [{"claim": item["claim"], "supported": True}
+                         for item in payload["claims"]]
+            return SimpleNamespace(content=json.dumps({"claims": decisions}))
+
+    monkeypatch.setattr(critic, "_make_model", lambda _provider: Model())
+    answer = (
+        "The reports state different scopes for these figures (R-101, page 8; R-102, page 13). "
+        "Keep the reported values separate (R-101, page 8; R-102, page 13)."
+    )
+
+    result = critic.verify_claims(answer, evidence)
+
+    assert result["status"] == "verified"
+    assert "average figures" in inspected["task"]
+    assert "do not infer which figure is more accurate" in inspected["task"]
 
 
 def test_conflict_correction_cannot_drop_either_report_and_escalates_without_leaking(monkeypatch):
@@ -117,3 +166,61 @@ def test_missing_second_report_does_not_fall_through_to_single_source_answer(mon
     assert result["generation_outcome"] == "insufficient_conflict_sources"
     assert result.get("escalation_reason")
     assert "one figure as definitive" in result["answer"]
+
+
+def test_forecast_period_comparison_extracts_and_cites_each_report(monkeypatch):
+    evidence = conflict_evidence()
+    monkeypatch.setattr(settings, "confidence_threshold", 0.70)
+    monkeypatch.setattr(agent, "verify_claims", lambda _answer, _evidence: {
+        "status": "verified", "reason": None, "claims": [{"status": "supported"} for _ in range(2)],
+    })
+    question = "Compare the R-101 and R-102 forecast periods."
+
+    result = agent.answer({"question": question, "allowed": {"R-101", "R-102"},
+                           "route": "comparison", "evidence": evidence})
+
+    assert not result.get("escalation_reason")
+    assert result["generation_outcome"] == "deterministic_forecast_period_comparison"
+    assert "2025-2030" in result["answer"]
+    assert "2024-2029" in result["answer"]
+    assert "R-101, page 11" in result["answer"]
+    assert "R-102, page 14" in result["answer"]
+    assert verify_numeric_claims(result["answer"], evidence) == (True, [])
+
+
+def test_forecast_period_comparison_escalates_if_one_source_page_is_missing():
+    evidence = [item for item in conflict_evidence()
+                if not (item["report_id"] == "R-102" and item["page"] == 14)]
+    result = agent.answer({"question": "Compare the R-101 and R-102 forecast periods.",
+                           "allowed": {"R-101", "R-102"}, "route": "comparison", "evidence": evidence})
+
+    assert result.get("escalation_reason")
+    assert result["generation_outcome"] == "insufficient_forecast_sources"
+
+
+def test_critic_allows_scope_comparison_only_when_cited_pages_establish_difference(monkeypatch):
+    evidence = conflict_evidence()
+    inspected = {}
+
+    class Model:
+        def invoke(self, messages):
+            payload = json.loads(messages[1][1])
+            inspected["task"] = payload["task"].lower()
+            inspected["claim"] = payload["claims"][0]
+            decisions = [{"claim": item["claim"], "supported": True}
+                         for item in payload["claims"]]
+            return SimpleNamespace(content=json.dumps({"claims": decisions}))
+
+    monkeypatch.setattr(critic, "_make_model", lambda _provider: Model())
+    answer = (
+        "The reports state different scopes for these figures (R-101, page 8; R-102, page 13). "
+        "Keep the reported values separate (R-101, page 8; R-102, page 13)."
+    )
+
+    result = critic.verify_claims(answer, evidence)
+
+    assert result["status"] == "verified"
+    assert "different scopes" in answer
+    assert "cited_evidence" in inspected["task"]
+    assert inspected["claim"]["cited_pages"] == [8, 13]
+    assert {item["report_id"] for item in inspected["claim"]["cited_evidence"]} == {"R-101", "R-102"}

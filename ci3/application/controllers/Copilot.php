@@ -47,4 +47,9 @@ class Copilot extends CI_Controller {
         }
         redirect('/copilot');
     }
+
+    public function reset() {
+        $this->session->unset_userdata('conversation_id');
+        redirect('/copilot');
+    }
 }

@@ -106,6 +106,9 @@ def test_groq_correction_parses_valid_provider_answer_and_keeps_context(monkeypa
     prompt = "\n".join(message[1] for message in captured["messages"])
     assert "Retrieved evidence" in prompt
     assert "discusses replacement demand" in prompt
+    assert "do not call that topic a driver" in prompt
+    assert "Reported facts:' and 'Inference:' sections" in prompt
+    assert "missing_citation or invalid_citation" in prompt
     assert captured["kwargs"]["model_kwargs"] == {"reasoning_effort": "low"}
 
 
@@ -407,3 +410,16 @@ def test_api_returns_safe_configuration_error_instead_of_analyst_fallback(monkey
     assert response.status_code == 503
     assert response.json()["detail"] == "Groq is selected but GROQ_API_KEY is missing."
     assert "analyst" not in response.text.lower()
+
+
+def test_provider_rate_limit_http_mapping_is_safe_and_correlatable():
+    error = LLMProviderError("rate_limit", 429,
+                             "Groq rate limit reached. Retry after a short delay.",
+                             {"upstream_body": "private provider response"})
+
+    response_error = main._provider_error_http_exception(error, "req-safe-id")
+
+    assert response_error.status_code == 429
+    assert response_error.detail == "Groq rate limit reached. Retry after a short delay."
+    assert response_error.headers == {"X-Request-ID": "req-safe-id"}
+    assert "private provider response" not in str(response_error.detail)
