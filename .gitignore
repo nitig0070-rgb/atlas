@@ -1,0 +1,42 @@
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+
+# Python virtual environments and generated caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Runtime databases, vector stores, and generated logs/artifacts
+chroma_data/
+qdrant_data/
+mysql_data/
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.sql.gz
+*.log
+*.log.*
+ci3/application/logs/*
+
+# Local dependency/build output
+vendor/
+node_modules/
+dist/
+build/
+
+# Private keys and certificate bundles
+*.pem
+*.key
+*.p12
+*.pfx
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/

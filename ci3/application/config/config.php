@@ -1,0 +1,24 @@
+<?php
+defined('BASEPATH') OR exit('No direct script access allowed');
+$config['base_url'] = getenv('CI3_BASE_URL') ?: 'http://localhost:8080/';
+$config['charset'] = 'UTF-8';
+$config['index_page'] = '';
+$config['enable_query_strings'] = FALSE;
+$config['uri_protocol'] = 'REQUEST_URI';
+$config['subclass_prefix'] = 'MY_';
+$config['encryption_key'] = getenv('CI3_ENCRYPTION_KEY') ?: 'local-only-change-this-key-0123456789';
+$config['log_path'] = '/tmp/project_atlas_logs/';
+$config['log_threshold'] = 0;
+$config['log_file_extension'] = 'php';
+$config['log_file_permissions'] = 0644;
+$config['log_date_format'] = 'Y-m-d H:i:s';
+$config['sess_driver'] = 'files';
+$config['sess_save_path'] = sys_get_temp_dir();
+$config['csrf_protection'] = TRUE;
+$config['csrf_token_name'] = 'csrf_test_name';
+$config['csrf_cookie_name'] = 'csrf_cookie_name';
+$config['csrf_expire'] = 7200;
+$config['csrf_regenerate'] = TRUE;
+$config['csrf_exclude_uris'] = [];
+$config['composer_autoload'] = FALSE;
+$config['permitted_uri_chars'] = 'a-z 0-9~%.:_\-';

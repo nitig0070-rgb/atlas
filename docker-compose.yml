@@ -1,0 +1,76 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change_me_root_local_only}
+      MYSQL_DATABASE: project_atlas
+      MYSQL_USER: atlas
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-change_me_local_only}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping --host=127.0.0.1 --user=root --password=\"$${MYSQL_ROOT_PASSWORD}\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  ollama:
+    image: ollama/ollama:0.5.4
+    profiles: ["local-llm"]
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+
+  api:
+    build: ./ai-service
+    env_file: .env
+    depends_on:
+      mysql:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./ai-service/data/reports:/app/data/reports:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5); exit(0 if json.load(r)['status']=='ok' else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 120s
+
+  portal:
+    build: ./ci3
+    environment:
+      AI_SERVICE_URL: http://api:8000
+      AI_SERVICE_API_KEY: ${API_KEY}
+      DB_PASSWORD: ${MYSQL_PASSWORD:-change_me_local_only}
+      CI3_ENCRYPTION_KEY: ${CI3_ENCRYPTION_KEY:-change-this-local-session-key-before-use}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "8080:80"
+    healthcheck:
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1/') === false);"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mysql_data:
+  qdrant_data:
+  ollama_data:
