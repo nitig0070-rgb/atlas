@@ -12,6 +12,7 @@ from app.database import create_escalation, engine, entitled_reports, record_sec
 from app.rag import ingest_report, REPORT_DIR, vector_store_ready
 from app.schemas import ChatRequest, ChatResponse, IngestRequest
 from app.security import is_unsafe_request, require_api_key
+from app.cache import response_cache
 from app.writer import LLMProviderError
 
 class JsonFormatter(logging.Formatter):
@@ -92,6 +93,18 @@ def chat(request: ChatRequest):
             message_id = persist_turn(conv_id, request.client_id, request.message, response_text)
             return ChatResponse(answer=response_text, confidence=0.99, conversation_id=conv_id,
                                 request_id=request_id, message_id=message_id)
+    cached_data = response_cache.get(request.client_id, request.message, allowed)
+    if cached_data is not None:
+        elapsed = int((time.perf_counter() - started) * 1000)
+        message_id = persist_turn(conv_id, request.client_id, request.message, cached_data.get("answer", ""))
+        record_request(request.client_id, request_id, elapsed, "cache_hit",
+                       token_usage=0, estimated_cost=0.0, input_tokens=0, output_tokens=0)
+        logger.info("request_id=%s cache_hit=True latency_ms=%d client_id=%s", request_id, elapsed, request.client_id)
+        return ChatResponse(answer=cached_data.get("answer", ""), citations=cached_data.get("citations", []),
+            confidence=cached_data.get("confidence", 0.95), conflicts=cached_data.get("conflicts", []),
+            derived_values=cached_data.get("derived_values", []), escalated=False,
+            conversation_id=conv_id, request_id=request_id, message_id=message_id,
+            token_usage=0, estimated_cost=0.0, cached=True)
     try:
         result = workflow.invoke({"question": request.message, "allowed": allowed, "client_id": request.client_id})
     except LLMProviderError as exc:
@@ -106,6 +119,8 @@ def chat(request: ChatRequest):
     escalated = bool(result.get("escalation_reason"))
     if escalated:
         result["answer"] = "I don't have enough reliable evidence to answer this confidently. I've escalated the question to an analyst."
+    else:
+        response_cache.set(request.client_id, request.message, allowed, result)
     message_id = persist_turn(conv_id, request.client_id, request.message, result.get("answer", ""))
     if escalated:
         create_escalation(request.client_id, conv_id, request.message, result["escalation_reason"], result["confidence"])

@@ -21,8 +21,8 @@ class Settings(BaseSettings):
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     chunk_size_chars: int = 1200
     chunk_overlap_chars: int = 160
-    llm_input_cost_per_1k: float | None = None
-    llm_output_cost_per_1k: float | None = None
+    llm_input_cost_per_1k: float | None = 0.00015
+    llm_output_cost_per_1k: float | None = 0.00060
 
     @field_validator("llm_provider")
     @classmethod

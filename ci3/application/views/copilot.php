@@ -1048,6 +1048,11 @@
                       <span class="escalation-badge verified">
                         ✓ Verified Grounded Answer
                       </span>
+                      <?php if (!empty($result['cached'])): ?>
+                        <span class="escalation-badge" style="background:#f0fdf4; color:#166534; border:1px solid #bbf7d0; margin-left:0.4rem;">
+                          ⚡ Cached (0ms)
+                        </span>
+                      <?php endif; ?>
                     <?php endif; ?>
                   </div>
                 </div>

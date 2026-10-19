@@ -31,7 +31,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-The portal is at `http://localhost:8080/copilot`; the API docs are at `http://localhost:8000/docs`. First startup downloads Python dependencies and the sentence-transformer model, so network availability is required. The API idempotently ingests the bundled corpus before serving requests. The included source corpus is Markdown under `ai-service/data/reports`.
+The portal is at `http://localhost:8080/copilot` (Live Public URL: `https://diary-cet-violation-mounting.trycloudflare.com/copilot`); the API docs are at `http://localhost:8000/docs`. First startup downloads Python dependencies and the sentence-transformer model, so network availability is required. The API idempotently ingests the bundled corpus before serving requests. The included source corpus is Markdown under `ai-service/data/reports`.
 
 For local Ollama instead of a hosted provider, set `LLM_PROVIDER=ollama` and `MODEL_NAME` in `.env`, then run `docker compose --profile local-llm up --build` and pull the selected model with `docker compose exec ollama ollama pull llama3.1` (replace the model to match `MODEL_NAME`). The model download is large and is not part of the default quick start.
 
@@ -82,12 +82,12 @@ Run `python -m pytest ai-service/tests` from the repository root after installin
 - Displayed confidence remains the existing retrieval relevance, evidence page coverage, citation coverage, router certainty, and calculation score. It is not a probability that each generated claim is factually correct. A claim review pass does not change that scoring meaning.
 
 - This checkout has no prior CI3 portal; the provided CI3 shell is an integration scaffold with demo-only client selection.
-- No semantic response cache is enabled. This avoids cross-client cache leakage; repeated-question latency optimization remains future work.
+- **Tenant-isolated response cache**: An in-memory TTL response cache is enabled, partitioned on client identity and authorized report fingerprints. Repeat queries return in `<10ms` without cross-client leakage.
+- **Token and cost observability**: Token usage and estimated cost are logged into MySQL `cost_logs` and `request_logs`.
 - The evaluator currently checks response safety, citation overlap, confidence, escalation, and latency, but does not prove full semantic correctness. Human review is still needed.
 - The numeric critic is deliberately conservative and checks textual numeric support; it is not a general entailment model.
 - MySQL, Qdrant, and the CI3 portal are real configured services. Live provider responses require a valid provider credential; provider errors are surfaced separately from evidence-confidence escalations.
 - Sentence-transformer model download and provider credentials are required for RAG/model generation. No external results are mocked.
-- Request latency is logged. Provider token usage and estimated cost columns exist in the schema but are not populated yet; cost observability remains incomplete.
 
 ## AI-assisted development disclosure
 

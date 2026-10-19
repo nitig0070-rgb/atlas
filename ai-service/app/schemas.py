@@ -26,6 +26,7 @@ class ChatResponse(BaseModel):
     message_id: int | None = None
     token_usage: int | None = None
     estimated_cost: float | None = None
+    cached: bool = False
 
 
 class IngestRequest(BaseModel):
