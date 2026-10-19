@@ -24,6 +24,12 @@ _UNRESOLVED_PREDICATE = re.compile(
     r"finds?|notes?|uses?|provides?|projects?|forecasts?|highlights?|emphasizes?|causes?|drives?|"
     r"increases?|decreases?|declines?|rises?|falls?)\b", re.IGNORECASE,
 )
+_SHARED_SUBJECT_NONQUANTIFICATION = re.compile(
+    r"^(?P<subject>(?:the|this|these|those)\s+(?:[\w-]+\s+){0,5}?)"
+    r"(?P<verb>provides?|reports?|shows?|indicates?|offers?|gives?)\s+"
+    r"(?P<first>.+?)\s+and does not quantify (?P<second>.+)$",
+    re.IGNORECASE,
+)
 _HYPHENATED_TERM = re.compile(r"\b[\w]+(?:[-‐‑‒–—][\w]+)+\b", re.IGNORECASE)
 
 
@@ -49,14 +55,26 @@ def _answer_claims(answer: str) -> list[tuple[str, list[int], bool, set[str]]]:
             continue
         pages = [int(page) for page in PAGE_REFERENCE_PATTERN.findall(sentence)]
         report_refs = {report.upper() for report in REPORT_ID_PATTERN.findall(sentence)}
-        unresolved_compound = bool(_UNRESOLVED_PREDICATE.search(sentence))
         without_pages = PAGE_REFERENCE_PATTERN.sub("", sentence)
         without_pages = re.sub(r"\(\s*\)", "", without_pages)
         without_pages = re.sub(r"\(\s*(?:R-\d{3}|[,;:])*\s*\)", "", without_pages, flags=re.IGNORECASE)
-        for claim in _CLAUSE_SPLIT.split(without_pages):
+        # A narrow shared-subject construction appears in R-103's page 8
+        # summary. Split its two assertions while repeating the subject so
+        # both claims can be checked independently against the same citation.
+        shared_subject = _SHARED_SUBJECT_NONQUANTIFICATION.fullmatch(without_pages.strip())
+        if shared_subject:
+            subject = shared_subject.group("subject").strip()
+            verb = shared_subject.group("verb")
+            clauses = [
+                f"{subject} {verb} {shared_subject.group('first')}",
+                f"{subject} does not quantify {shared_subject.group('second')}",
+            ]
+        else:
+            clauses = _CLAUSE_SPLIT.split(without_pages)
+        for claim in clauses:
             claim = claim.strip(" ,:;() ").rstrip(".!? ")
             if claim:
-                claims.append((claim, pages, unresolved_compound, report_refs))
+                claims.append((claim, pages, bool(_UNRESOLVED_PREDICATE.search(claim)), report_refs))
     return claims
 
 

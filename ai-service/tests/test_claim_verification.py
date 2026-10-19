@@ -76,6 +76,23 @@ def test_unparsed_coordinated_predicates_fail_closed():
     assert result["claims"][0]["status"] == "compound_claim_requires_review"
 
 
+def test_r103_page8_qualitative_and_nonquantification_claim_is_reviewed_separately(monkeypatch):
+    model = VerdictModel()
+    mock_critic(monkeypatch, model)
+    page8 = evidence(
+        "The report provides qualitative regional outlook and does not quantify regional share or a forecast value.",
+        page=8,
+    )
+    answer = (
+        "The regional outlook provides only qualitative direction and does not quantify regional share "
+        "or forecast values (page 8, report R-103)."
+    )
+    result = critic.verify_claims(answer, page8)
+    assert result["status"] == "verified", result
+    assert len(result["claims"]) == 2
+    assert all(claim["pages"] == [8] for claim in result["claims"])
+
+
 def test_claim_citing_wrong_page_is_rejected_without_llm(monkeypatch):
     monkeypatch.setattr(critic, "_make_model", lambda _p: (_ for _ in ()).throw(AssertionError("must not call critic")))
     result = critic.verify_claims("The report discusses replacement demand (page 5).", evidence(page=4))
