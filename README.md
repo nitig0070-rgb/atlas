@@ -31,7 +31,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-The portal is at `http://localhost:8080/copilot` (Live Public URL: `https://diary-cet-violation-mounting.trycloudflare.com/copilot`); the API docs are at `http://localhost:8000/docs`. First startup downloads Python dependencies and the sentence-transformer model, so network availability is required. The API idempotently ingests the bundled corpus before serving requests. The included source corpus is Markdown under `ai-service/data/reports`.
+The portal is at `http://localhost:8080/copilot` (Live Public URL: `https://criterion-chi-eau-forward.trycloudflare.com/copilot`); the API docs are at `http://localhost:8000/docs`. First startup downloads Python dependencies and the sentence-transformer model, so network availability is required. The API idempotently ingests the bundled corpus before serving requests. The included source corpus is Markdown under `ai-service/data/reports`.
 
 For local Ollama instead of a hosted provider, set `LLM_PROVIDER=ollama` and `MODEL_NAME` in `.env`, then run `docker compose --profile local-llm up --build` and pull the selected model with `docker compose exec ollama ollama pull llama3.1` (replace the model to match `MODEL_NAME`). The model download is large and is not part of the default quick start.
 
